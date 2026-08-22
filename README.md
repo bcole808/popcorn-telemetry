@@ -81,8 +81,22 @@ written to `config.py`, and every new recording starts back at
 `PLOT_WINDOW_SECONDS`. The CSV always records the whole session regardless of
 what's on screen.
 
-Stopping prints a one-line summary: session name, duration, min/max/avg humidity
-and temperature, row count, and the file path.
+Stopping clears the plot and draws a boxed summary panel — session name,
+duration, average temperature, the session's **max and average humidity** in
+large block type, the best and worst average humidity across today's runs, a
+random popcorn sign-off, and the file path. The panel is drawn from the top of a
+cleared screen so it always stays visible above the menu.
+
+The best/worst line is computed by reading every `data/` CSV whose filename
+carries today's date, this session included. "Best" is the lowest average
+humidity and "worst" the highest. It only appears once there are two or more
+runs on the day — with a single run it would just restate the panel above it.
+
+On a narrow or short terminal the panel falls back to compact type and shrinks to
+fit rather than breaking its border.
+
+The sign-off lines live in [phrases.py](phrases.py) — add or edit freely, keeping
+them under 160 characters so they wrap to at most two lines.
 
 ## Markers
 

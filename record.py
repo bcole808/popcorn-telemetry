@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import math
 import os
 import random
@@ -17,6 +18,7 @@ import select
 import shutil
 import sys
 import termios
+import textwrap
 import time
 import tty
 from collections import deque
@@ -26,8 +28,11 @@ from datetime import datetime
 import plotext as plt
 
 import config
+import phrases
 
-HEADER = ["seconds_elapsed", "humidity", "temperature_f", "label", "timestamp"]
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+HEADER =["seconds_elapsed", "humidity", "temperature_f", "label", "timestamp"]
 
 # Serial devices that are never our board.
 PORT_BLOCKLIST = ("Bluetooth-Incoming-Port", "debug-console")
@@ -39,6 +44,26 @@ WINDOW_MIN = 30
 
 HIGHLIGHT = "\033[93m"  # bright yellow — marks the most recently pressed marker
 RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+CYAN = "\033[96m"
+
+BOX_MAX_WIDTH = 88
+
+# 5-row block glyphs for the headline numbers in the end-of-session panel.
+BIG_GLYPHS = {
+    "0": ["███", "█ █", "█ █", "█ █", "███"],
+    "1": [" █ ", "██ ", " █ ", " █ ", "███"],
+    "2": ["███", "  █", "███", "█  ", "███"],
+    "3": ["███", "  █", "███", "  █", "███"],
+    "4": ["█ █", "█ █", "███", "  █", "  █"],
+    "5": ["███", "█  ", "███", "  █", "███"],
+    "6": ["███", "█  ", "███", "█ █", "███"],
+    "7": ["███", "  █", "  █", "  █", "  █"],
+    "8": ["███", "█ █", "███", "█ █", "███"],
+    "9": ["███", "█ █", "███", "  █", "███"],
+    ".": ["   ", "   ", "   ", "   ", " █ "],
+}
 
 
 def c_to_f(celsius: float) -> float:
@@ -164,24 +189,62 @@ class SimulatedSource:
 # --------------------------------------------------------------------------
 
 
+def short(name: str, limit: int = 13) -> str:
+    """Clip a session name so two of them fit on one line of the panel."""
+    return name if len(name) <= limit else name[: limit - 1] + "…"
+
+
 def slugify(name: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     return slug
 
 
+def data_dir() -> str:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), config.DATA_DIR)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def session_avg_humidity(path: str) -> float | None:
+    """Mean humidity of a recorded session, or None if it holds no readings."""
+    try:
+        with open(path, newline="") as handle:
+            values = [
+                float(row["humidity"])
+                for row in csv.DictReader(handle)
+                if row.get("humidity")
+            ]
+    except (OSError, ValueError, KeyError):
+        return None  # a malformed file must not take down the summary
+    return sum(values) / len(values) if values else None
+
+
+def todays_runs(when: datetime | None = None) -> list[tuple[str, float]]:
+    """(session name, average humidity) for each session recorded today."""
+    when = when or datetime.now()
+    runs = []
+    for path in sorted(glob.glob(os.path.join(data_dir(), f"{when:%Y-%m-%d}__*.csv"))):
+        average = session_avg_humidity(path)
+        if average is None:
+            continue
+        # 2026-08-22__4-45pm__my-session.csv -> "my-session"
+        parts = os.path.basename(path)[:-4].split("__")
+        runs.append((parts[2] if len(parts) > 2 else parts[1], average))
+    return runs
+
+
 def session_path(name: str, when: datetime | None = None) -> str:
     when = when or datetime.now()
-    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), config.DATA_DIR)
-    os.makedirs(data_dir, exist_ok=True)
+    data_dir_path = data_dir()
 
     stamp = f"{when:%Y-%m-%d}__{when.hour % 12 or 12}-{when:%M}{when:%p}".lower()
     slug = slugify(name)
     base = f"{stamp}__{slug}" if slug else stamp
 
-    path = os.path.join(data_dir, f"{base}.csv")
+    path = os.path.join(data_dir_path, f"{base}.csv")
     n = 2
     while os.path.exists(path):
-        path = os.path.join(data_dir, f"{base}-{n}.csv")
+        path = os.path.join(data_dir_path, f"{base}-{n}.csv")
         n += 1
     return path
 
@@ -205,6 +268,106 @@ def cbreak_stdin():
         sys.stdout.write("\033[?25h\033[0m")
         sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def term_size():
+    """The terminal's real size.
+
+    shutil.get_terminal_size() trusts the COLUMNS/LINES environment variables
+    ahead of the terminal itself, and those go stale after a resize (and are
+    often wrong under VS Code and tmux). An over-large height here means an
+    over-tall chart, which scrolls the frame on every redraw.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            return os.get_terminal_size(stream.fileno())
+        except (OSError, ValueError, AttributeError):
+            continue
+    return shutil.get_terminal_size((100, 30))
+
+
+def big_number(text):
+    """Render a numeric string as 5 rows of block glyphs."""
+    rows = ["", "", "", "", ""]
+    for char in text:
+        glyph = BIG_GLYPHS.get(char)
+        if glyph is None:
+            continue
+        for i in range(5):
+            rows[i] += glyph[i] + " "
+    return [row[:-1] for row in rows]
+
+
+def big_stats(max_rh, avg_rh, inner):
+    """Two headline stats side by side as (text, style) rows, or None if too wide."""
+    left, right = big_number(f"{max_rh:.2f}"), big_number(f"{avg_rh:.2f}")
+    labels = ("MAX HUMIDITY  %RH", "AVERAGE HUMIDITY  %RH")
+    lw = max(len(left[0]), len(labels[0]))
+    rw = max(len(right[0]), len(labels[1]))
+    gap = 6
+    if lw + gap + rw > inner:
+        return None
+
+    out = [(labels[0].center(lw) + " " * gap + labels[1].center(rw), DIM)]
+    for i in range(5):
+        out.append(
+            (left[i].center(lw) + " " * gap + right[i].center(rw), CYAN + BOLD)
+        )
+    return out
+
+
+def summary_panel(name, clock, avg_temp_f, max_rh, avg_rh, path, pun, today_line):
+    """A bordered end-of-session panel. Returns a list of printable lines."""
+    term_w, term_h = term_size()
+    box_w = min(BOX_MAX_WIDTH, max(24, term_w - 2))
+    inner = box_w - 4  # two border chars plus a space of padding each side
+
+    # Each entry is (plain text, style) so the text can be centred on its real
+    # width before the escape codes are wrapped around it.
+    # Trim the session name rather than the metadata, so duration and average
+    # temperature survive on a narrow terminal.
+    meta = f"  ·  {clock}  ·  {avg_temp_f:.2f} °F avg"
+    name_max = max(8, inner - len(meta))
+    short_name = name if len(name) <= name_max else name[: name_max - 1] + "…"
+
+    body = [
+        ("SESSION COMPLETE", BOLD),
+        (short_name + meta, DIM),
+        ("", ""),
+    ]
+
+    # Fall back to a compact line if the terminal is too narrow for the big type
+    # or too short to show the panel and the menu that follows it.
+    stats = big_stats(max_rh, avg_rh, inner)
+    compact = f"MAX {max_rh:.2f} %RH     AVERAGE {avg_rh:.2f} %RH"
+    if stats and term_h >= 24:
+        body.extend(stats)
+    elif len(compact) <= inner:
+        body.append((compact, CYAN + BOLD))
+    else:
+        body.append((f"MAX {max_rh:.2f} %RH", CYAN + BOLD))
+        body.append((f"AVERAGE {avg_rh:.2f} %RH", CYAN + BOLD))
+    body.append(("", ""))
+    if today_line:
+        body.append((today_line, DIM))
+    body.extend((ln, HIGHLIGHT) for ln in textwrap.wrap(pun, inner))
+    body.append(("", ""))
+    # Keep the filename rather than the directory when the path won't fit.
+    body.append((path if len(path) <= inner else os.path.basename(path), DIM))
+
+    top = "╭" + "─" * (box_w - 2) + "╮"
+    bottom = "╰" + "─" * (box_w - 2) + "╯"
+
+    out = [top]
+    for text, style in body:
+        # center() never truncates, so clamp first — an over-long line would
+        # otherwise push the right-hand border out and break the box.
+        if len(text) > inner:
+            text = text[: inner - 1] + "…"
+        centred = text.center(inner)
+        out.append(f"│ {style}{centred}{RESET if style else ''} │")
+    out.append(bottom)
+    return out
 
 
 def hint_lines(width, window, last_marker):
@@ -241,7 +404,7 @@ def hint_lines(width, window, last_marker):
 
 def render(points, elapsed, latest, rows, note, session_name, window, last_marker):
     """Draw the readout + rolling humidity chart, in place."""
-    width, height = shutil.get_terminal_size((100, 30))
+    width, height = term_size()
 
     if latest:
         temp_f, humidity = latest
@@ -252,15 +415,24 @@ def render(points, elapsed, latest, rows, note, session_name, window, last_marke
     else:
         readout = "  waiting for the first reading..."
 
+    # Wrap hints to width - 4 so that, once indented, no line ever reaches the
+    # last column — landing exactly on it makes some terminals wrap early.
     lines = [
-        f"  RECORDING  {session_name}"[:width],
-        readout[:width],
+        # Two blank rows of top padding. chart_height is derived from
+        # len(lines), so these shrink the chart rather than growing the frame.
         "",
-        *(f"  {ln}" for ln in hint_lines(max(20, width - 2), window, last_marker)),
-        f"  {note}"[:width] if note else "",
+        "",
+        f"  RECORDING  {session_name}"[: width - 1],
+        readout[: width - 1],
+        "",
+        *(f"  {ln}" for ln in hint_lines(max(20, width - 4), window, last_marker)),
     ]
+    if note:  # only take a row when there is actually something to say
+        lines.append(f"  {note}"[: width - 1])
 
-    chart_height = max(8, height - len(lines) - 2)
+    # Total drawn height is len(lines) + chart_height, which must stay under the
+    # terminal height or the frame scrolls.
+    chart_height = max(6, height - len(lines) - 1)
     plt.clf()
     plt.theme("clear")  # inherit the terminal's own colours instead of forcing white
     plt.plotsize(width - 2, chart_height)
@@ -286,7 +458,10 @@ def render(points, elapsed, latest, rows, note, session_name, window, last_marke
     plt.title(f"humidity — last {span}s")
     plt.xlabel("seconds elapsed")
 
-    out = "\033[H" + "\n".join(lines) + "\n" + plt.build() + "\033[0J"
+    # plt.build() ends with a newline; keeping it would park the cursor one row
+    # below the frame and scroll the terminal by a line on every redraw.
+    chart = plt.build().rstrip("\n")
+    out = "\033[H" + "\n".join(lines) + "\n" + chart + "\033[0J"
     sys.stdout.write(out)
     sys.stdout.flush()
 
@@ -408,22 +583,39 @@ def record(source, name: str) -> None:
 
     duration = 0.0 if start is None else time.time() - start
     clock = f"{int(duration // 60):02d}:{int(duration % 60):02d}"
-    sys.stdout.write("\033[2J\033[H")
+
+    # Clear and home the cursor so the panel is drawn from the top of a fresh
+    # screen — it can't be scrolled off by the frames that came before it.
+    # The two blank rows match the recording screen's top padding.
+    sys.stdout.write("\033[2J\033[H\n\n")
 
     if humidities:
-        stats = (
-            f"RH {min(humidities):.2f}/{max(humidities):.2f}/"
-            f"{sum(humidities) / len(humidities):.2f} · "
-            f"°F {min(temps_f):.2f}/{max(temps_f):.2f}/"
-            f"{sum(temps_f) / len(temps_f):.2f} (min/max/avg)"
-        )
-    else:
-        stats = "no readings"
+        # Read back today's sessions — this one included, since it is already
+        # written and closed — for the day's best and worst averages.
+        runs = todays_runs()
+        today_line = ""
+        if len(runs) >= 2:
+            best = min(runs, key=lambda run: run[1])
+            worst = max(runs, key=lambda run: run[1])
+            today_line = (
+                f"today's best avg {best[1]:.2f} %RH ({short(best[0])})"
+                f"   ·   worst avg {worst[1]:.2f} %RH ({short(worst[0])})"
+            )
 
-    print(
-        f"{display_name} · {clock} · {stats} · {rows} rows · "
-        f"{os.path.relpath(path)}\n"
-    )
+        panel = summary_panel(
+            display_name,
+            clock,
+            sum(temps_f) / len(temps_f),
+            max(humidities),
+            sum(humidities) / len(humidities),
+            os.path.relpath(path),
+            random.choice(phrases.PHRASES),
+            today_line,
+        )
+        print("\n".join(panel))
+    else:
+        print(f"{display_name} · {clock} · no readings · {os.path.relpath(path)}")
+    print()
 
 
 # --------------------------------------------------------------------------
