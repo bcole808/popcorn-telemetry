@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import json
 import math
 import os
 import random
@@ -32,8 +33,6 @@ import config
 import phrases
 
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
-# Optional ambient-conditions segments in a session filename, e.g. 56rh / 75deg.
-AMBIENT_RE = re.compile(r"^-?\d+(rh|deg)$")
 
 HEADER =["seconds_elapsed", "humidity", "temperature_f", "label", "timestamp"]
 
@@ -177,11 +176,14 @@ class SimulatedSource:
 # --------------------------------------------------------------------------
 
 
-def ask_optional_number(prompt: str) -> int | None:
+def ask_optional_number(
+    prompt: str, low: float | None = None, high: float | None = None
+) -> int | None:
     """Ask for a number the user may skip with a bare Enter.
 
     Tolerates a trailing unit ("56%", "75F", "75°F") and re-asks on anything
-    that isn't a number, so a typo can't silently become a missing reading.
+    that isn't a number or falls outside [low, high], so a typo can't silently
+    become a missing or nonsense reading.
     """
     while True:
         try:
@@ -192,9 +194,14 @@ def ask_optional_number(prompt: str) -> int | None:
             return None
         cleaned = raw.rstrip("%").strip().rstrip("Ff").strip().rstrip("°").strip()
         try:
-            return round(float(cleaned))
+            value = round(float(cleaned))
         except ValueError:
             print("    Please enter a number, or press Enter to skip.")
+            continue
+        if (low is not None and value < low) or (high is not None and value > high):
+            print(f"    Please enter a number between {low:g} and {high:g}.")
+            continue
+        return value
 
 
 def short(name: str, limit: int = 13) -> str:
@@ -240,33 +247,34 @@ def todays_runs(when: datetime | None = None) -> list[tuple[str, float]]:
 
 
 def session_label(path: str) -> str:
-    """The session name out of a filename, skipping the ambient segments.
+    """The session name out of a filename, falling back to the time of day.
 
-    2026-08-22__1-59pm__56rh__75deg__my-session.csv -> "my-session"
+    2026-08-22__1-59pm__my-session.csv -> "my-session"
     """
     parts = os.path.basename(path)[:-4].split("__")
-    named = [p for p in parts[2:] if not AMBIENT_RE.match(p)]
-    return named[0] if named else parts[1]
+    return parts[2] if len(parts) > 2 else parts[1]
 
 
-def session_path(
-    name: str,
-    ambient_rh: int | None = None,
-    ambient_f: int | None = None,
-    when: datetime | None = None,
-) -> str:
+def metadata_path(csv_path: str) -> str:
+    return os.path.splitext(csv_path)[0] + ".json"
+
+
+def write_metadata(csv_path: str, meta: dict) -> str:
+    """Write the run's sidecar JSON alongside its CSV."""
+    path = metadata_path(csv_path)
+    with open(path, "w") as handle:
+        json.dump(meta, handle, indent=2)
+        handle.write("\n")
+    return path
+
+
+def session_path(name: str, when: datetime | None = None) -> str:
     when = when or datetime.now()
     data_dir_path = data_dir()
 
     stamp = f"{when:%Y-%m-%d}__{when.hour % 12 or 12}-{when:%M}{when:%p}".lower()
-    segments = [stamp]
-    if ambient_rh is not None:
-        segments.append(f"{ambient_rh}rh")
-    if ambient_f is not None:
-        segments.append(f"{ambient_f}deg")
-    if slugify(name):
-        segments.append(slugify(name))
-    base = "__".join(segments)
+    slug = slugify(name)
+    base = f"{stamp}__{slug}" if slug else stamp
 
     path = os.path.join(data_dir_path, f"{base}.csv")
     n = 2
@@ -497,9 +505,9 @@ def welcome_screen():
 
     # Leave room for the two prompts that print underneath, plus a spare row,
     # then shed padding and finally the block letters until it fits.
-    # Four prompts print underneath now (name, humidity, temperature, Enter),
-    # plus a spare row.
-    room = height - 5
+    # Five prompts print underneath (name, humidity, temperature, fan speed,
+    # Enter), plus a spare row.
+    room = height - 6
     screen = build(True, True)
     for pad, big in ((False, True), (False, False)):
         if len(screen) <= room:
@@ -600,8 +608,21 @@ def record(
     name: str,
     ambient_rh: int | None = None,
     ambient_f: int | None = None,
+    fan_pct: int | None = None,
 ) -> None:
-    path = session_path(name, ambient_rh, ambient_f)
+    path = session_path(name)
+
+    # Skipped answers are recorded as null rather than omitted, so the sidecar
+    # has a stable shape and a blank is distinguishable from a missing field.
+    meta = {
+        "session_name": name or None,
+        "csv": os.path.basename(path),
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "ambient_humidity_rh": ambient_rh,
+        "ambient_temperature_f": ambient_f,
+        "fan_speed_pct": fan_pct,
+    }
+    write_metadata(path, meta)  # written up front so a crashed run keeps it
     display_name = name or "(untitled)"
 
     points: deque[tuple[float, float]] = deque()
@@ -719,6 +740,21 @@ def record(
     duration = 0.0 if start is None else time.time() - start
     clock = f"{int(duration // 60):02d}:{int(duration % 60):02d}"
 
+    # Fold in what the run itself produced, then rewrite the sidecar.
+    meta.update({
+        "ended_at": datetime.now().isoformat(timespec="seconds"),
+        "duration_seconds": round(duration),
+        "rows": rows,
+        "humidity_max": round(max(humidities), 2) if humidities else None,
+        "humidity_avg": (
+            round(sum(humidities) / len(humidities), 2) if humidities else None
+        ),
+        "temperature_f_avg": (
+            round(sum(temps_f) / len(temps_f), 2) if temps_f else None
+        ),
+    })
+    write_metadata(path, meta)
+
     # Clear and home the cursor so the panel is drawn from the top of a fresh
     # screen — it can't be scrolled off by the frames that came before it.
     # The two blank rows match the recording screen's top padding.
@@ -789,13 +825,16 @@ def main() -> None:
             print("\n".join(welcome_screen()))
             name = input("  Session name: ").strip()
             ambient_rh = ask_optional_number(
-                "  Room humidity %RH (optional, Enter to skip): "
+                "  Room humidity %RH (optional, Enter to skip): ", 0, 100
             )
             ambient_f = ask_optional_number(
                 "  Room temperature °F (optional, Enter to skip): "
             )
+            fan_pct = ask_optional_number(
+                "  Fan speed % (optional, Enter to skip): ", 0, 100
+            )
             input("  Press Enter to start recording...")
-            record(source, name, ambient_rh, ambient_f)
+            record(source, name, ambient_rh, ambient_f, fan_pct)
     except KeyboardInterrupt:
         print()
     finally:

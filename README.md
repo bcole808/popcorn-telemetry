@@ -128,17 +128,48 @@ MARKERS = {
 
 ## Output
 
-Sessions land in `data/` (gitignored) as
-`2026-08-21__4-45pm__56rh__75deg__my-session-name.csv`.
+Each session writes a pair of files into `data/` (gitignored), sharing one name:
 
-After the session name you're asked for the room's ambient humidity and ambient
-temperature in °F. Both are optional — press Enter to skip either. Whichever you
-supply is rounded and added to the filename as a `56rh` / `75deg` segment, in
-that order; skipped ones are simply absent, as is the name if you left it blank.
-A trailing unit is tolerated (`56%`, `75F`, `75°F`), and anything that isn't a
-number re-asks rather than being silently dropped.
+```
+2026-08-21__4-45pm__my-session-name.csv     the readings
+2026-08-21__4-45pm__my-session-name.json    everything else about the run
+```
 
-Columns:
+### Setup questions
+
+After the session name you're asked for the room's ambient humidity, the room's
+ambient temperature in °F, and the fan speed as a percentage. All three are
+optional — press Enter to skip any of them. A trailing unit is tolerated (`56%`,
+`75F`, `75°F`); anything that isn't a number, or a percentage outside 0–100,
+re-asks rather than being silently dropped.
+
+### The JSON sidecar
+
+Holds the answers to those questions plus what the run produced. Skipped answers
+are recorded as `null` rather than being left out, so the shape is the same for
+every run and a skipped field is distinguishable from a missing one.
+
+```json
+{
+  "session_name": "kettle six",
+  "csv": "2026-08-22__3-20pm__kettle-six.csv",
+  "started_at": "2026-08-22T15:20:28",
+  "ambient_humidity_rh": 56,
+  "ambient_temperature_f": 75,
+  "fan_speed_pct": 40,
+  "ended_at": "2026-08-22T15:20:33",
+  "duration_seconds": 5,
+  "rows": 5,
+  "humidity_max": 47.47,
+  "humidity_avg": 45.97,
+  "temperature_f_avg": 75.8
+}
+```
+
+It's written once when recording starts, so a run that crashes still leaves its
+setup behind, then rewritten with the results when the session ends.
+
+### CSV columns
 
 | column | example | notes |
 | ------ | ------- | ----- |
