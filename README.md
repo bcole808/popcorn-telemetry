@@ -129,7 +129,16 @@ MARKERS = {
 ## Output
 
 Sessions land in `data/` (gitignored) as
-`2026-08-21__4-45pm__my-session-name.csv`:
+`2026-08-21__4-45pm__56rh__75deg__my-session-name.csv`.
+
+After the session name you're asked for the room's ambient humidity and ambient
+temperature in °F. Both are optional — press Enter to skip either. Whichever you
+supply is rounded and added to the filename as a `56rh` / `75deg` segment, in
+that order; skipped ones are simply absent, as is the name if you left it blank.
+A trailing unit is tolerated (`56%`, `75F`, `75°F`), and anything that isn't a
+number re-asks rather than being silently dropped.
+
+Columns:
 
 | column | example | notes |
 | ------ | ------- | ----- |
