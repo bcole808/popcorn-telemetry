@@ -1,8 +1,64 @@
-"""Sign-off lines shown at the end of a recording session.
+"""Rotating flavour text.
 
-One is picked at random each time. Keep them under 160 characters so they wrap
-to at most two lines inside the summary panel.
+PHRASES are sign-offs shown at the end of a recording session — keep them under
+160 characters so they wrap to at most two lines inside the summary panel.
+
+TAGLINES sit under the title on the welcome screen — keep them short, ideally
+under about 70 characters, so they fit on one line.
 """
+
+TAGLINES = [
+    "Every kernel tells a story. This one's in %RH.",
+    "Measuring the moment corn loses its composure.",
+    "Because guessing isn't a methodology.",
+    "Turning steam into science.",
+    "The humidity never lies.",
+    "Popcorn, quantified.",
+    "One sensor. A thousand tiny explosions.",
+    "Where snack meets spreadsheet.",
+    "Data so fresh it's still steaming.",
+    "Chasing the perfect pop, one second at a time.",
+    "Some measure twice. We measure twice per second.",
+    "Kernel-level observability. Literally.",
+    "The most instrumented snack in the building.",
+    "Because 'it smelled done' is not a data point.",
+    "Logging the loudest part of your kitchen.",
+    "From kettle to CSV.",
+    "Precision snacking starts here.",
+    "Watch the moisture. Trust the curve.",
+    "Science you can eat.",
+    "Every pop leaves a trace.",
+    "Humidity is just popcorn thinking out loud.",
+    "Two readings a second. Zero guesswork.",
+    "The graph goes up. So does the flavour.",
+    "Making steam accountable.",
+    "Instrumented corn, happier humans.",
+    "Debug your batch, not your appetite.",
+    "The kettle speaks. We take notes.",
+    "Butter through the data.",
+    "Popping is a process. Processes get measured.",
+    "Your machine has opinions. This records them.",
+    "A love letter to moisture, written in CSV.",
+    "Corn goes in. Insight comes out.",
+    "Not all heroes wear lab coats. Some wear aprons.",
+    "The only snack with a changelog.",
+    "Steam, sampled.",
+    "Where popcorn meets telemetry.",
+    "Sixty seconds of truth, rolling.",
+    "Because the perfect batch deserves evidence.",
+    "Reading the room. Specifically, its humidity.",
+    "Kernels don't lie, but memories do. Log it.",
+    "The sensor sees all.",
+    "Turn up the heat. We'll watch the numbers.",
+    "Snack telemetry for serious people.",
+    "Popcorn: now with receipts.",
+    "Measure the pop. Master the pop.",
+    "Every batch, on the record.",
+    "The humidity curve is the story.",
+    "Hot air, cold hard data.",
+    "Quantify the crunch.",
+    "Let the kettle cook. Let the sensor watch.",
+]
 
 PHRASES = [
     "Pop quiz: that was a perfect batch. Go enjoy every last kernel.",

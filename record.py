@@ -27,6 +27,7 @@ from datetime import datetime
 
 import plotext as plt
 
+import bigtext
 import config
 import phrases
 
@@ -49,21 +50,6 @@ DIM = "\033[2m"
 CYAN = "\033[96m"
 
 BOX_MAX_WIDTH = 88
-
-# 5-row block glyphs for the headline numbers in the end-of-session panel.
-BIG_GLYPHS = {
-    "0": ["███", "█ █", "█ █", "█ █", "███"],
-    "1": [" █ ", "██ ", " █ ", " █ ", "███"],
-    "2": ["███", "  █", "███", "█  ", "███"],
-    "3": ["███", "  █", "███", "  █", "███"],
-    "4": ["█ █", "█ █", "███", "  █", "  █"],
-    "5": ["███", "█  ", "███", "  █", "███"],
-    "6": ["███", "█  ", "███", "█ █", "███"],
-    "7": ["███", "  █", "  █", "  █", "  █"],
-    "8": ["███", "█ █", "███", "█ █", "███"],
-    "9": ["███", "█ █", "███", "  █", "███"],
-    ".": ["   ", "   ", "   ", "   ", " █ "],
-}
 
 
 def c_to_f(celsius: float) -> float:
@@ -103,7 +89,7 @@ class SerialSource:
         if not candidates:
             raise SystemExit(
                 "No serial port found. Plug in the ESP32 and try again, "
-                "or pass --port /dev/cu.something"
+                "or pass --port /dev/cu.something, or use --simulate for testing"
             )
         if len(candidates) > 1:
             print(f"Multiple ports found: {', '.join(candidates)}")
@@ -286,21 +272,52 @@ def term_size():
     return shutil.get_terminal_size((100, 30))
 
 
-def big_number(text):
-    """Render a numeric string as 5 rows of block glyphs."""
-    rows = ["", "", "", "", ""]
-    for char in text:
-        glyph = BIG_GLYPHS.get(char)
-        if glyph is None:
-            continue
-        for i in range(5):
-            rows[i] += glyph[i] + " "
-    return [row[:-1] for row in rows]
+def boxed(body, box_w):
+    """Draw (text, style) rows centred inside a rounded border."""
+    inner = box_w - 4
+    out = ["╭" + "─" * (box_w - 2) + "╮"]
+    for text, style in body:
+        # center() never truncates, so clamp first — an over-long line would
+        # otherwise push the right-hand border out and break the box.
+        if len(text) > inner:
+            text = text[: inner - 1] + "…"
+        centred = text.center(inner)
+        out.append(f"│ {style}{centred}{RESET if style else ''} │")
+    out.append("╰" + "─" * (box_w - 2) + "╯")
+    return out
+
+
+def title_rows(name, inner):
+    """Block-letter rows for `name`, wrapped over several lines if too wide.
+
+    Returns None when even a single word is too wide to render, leaving the
+    caller to fall back to plain text.
+    """
+    lines, current = [], ""
+    for word in name.split():
+        candidate = f"{current} {word}".strip()
+        if current and bigtext.width(candidate) > inner:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+
+    rows = []
+    for i, line in enumerate(lines):
+        if bigtext.width(line) > inner:
+            return None
+        if i:
+            rows.append("")  # breathing room between title lines
+        rows.extend(bigtext.render(line))
+    return rows
 
 
 def big_stats(max_rh, avg_rh, inner):
     """Two headline stats side by side as (text, style) rows, or None if too wide."""
-    left, right = big_number(f"{max_rh:.2f}"), big_number(f"{avg_rh:.2f}")
+    left = bigtext.render(f"{max_rh:.2f}")
+    right = bigtext.render(f"{avg_rh:.2f}")
     labels = ("MAX HUMIDITY  %RH", "AVERAGE HUMIDITY  %RH")
     lw = max(len(left[0]), len(labels[0]))
     rw = max(len(right[0]), len(labels[1]))
@@ -355,42 +372,21 @@ def summary_panel(name, clock, avg_temp_f, max_rh, avg_rh, path, pun, today_line
     # Keep the filename rather than the directory when the path won't fit.
     body.append((path if len(path) <= inner else os.path.basename(path), DIM))
 
-    top = "╭" + "─" * (box_w - 2) + "╮"
-    bottom = "╰" + "─" * (box_w - 2) + "╯"
-
-    out = [top]
-    for text, style in body:
-        # center() never truncates, so clamp first — an over-long line would
-        # otherwise push the right-hand border out and break the box.
-        if len(text) > inner:
-            text = text[: inner - 1] + "…"
-        centred = text.center(inner)
-        out.append(f"│ {style}{centred}{RESET if style else ''} │")
-    out.append(bottom)
-    return out
+    return boxed(body, box_w)
 
 
-def hint_lines(width, window, last_marker):
-    """The key hints as one flowing line, wrapped to fit, last marker in yellow.
+def wrap_tokens(items, width, sep="   "):
+    """Flow (plain, styled) items onto lines, wrapping on whole items.
 
-    Wraps on whole hints rather than on words, so a hint is never split across
-    two lines, and measures width on the uncoloured text so the escape codes
-    don't count against it.
+    An item is never split across two lines, and width is measured on the
+    uncoloured text so escape codes don't count against it. Returns
+    (plain, styled) pairs so callers can still centre on the real width.
     """
-    items = []
-    for key, label in config.MARKERS.items():
-        plain = f"[{key}] {label}"
-        styled = f"{HIGHLIGHT}{plain}{RESET}" if key == last_marker else plain
-        items.append((plain, styled))
-    for plain in ("[space] stop", f"[-/=] window={window}s"):
-        items.append((plain, plain))
-
-    sep = "   "
-    lines: list[str] = []
+    lines = []
     plain_line = styled_line = ""
     for plain, styled in items:
         if plain_line and len(plain_line) + len(sep) + len(plain) > width:
-            lines.append(styled_line)
+            lines.append((plain_line, styled_line))
             plain_line, styled_line = plain, styled
         elif plain_line:
             plain_line += sep + plain
@@ -398,11 +394,81 @@ def hint_lines(width, window, last_marker):
         else:
             plain_line, styled_line = plain, styled
     if styled_line:
-        lines.append(styled_line)
+        lines.append((plain_line, styled_line))
     return lines
 
 
-def render(points, elapsed, latest, rows, note, session_name, window, last_marker):
+def hint_lines(width, window, last_marker):
+    """The key hints as one flowing line, wrapped to fit, last marker in yellow."""
+    items = []
+    for key, label in config.MARKERS.items():
+        plain = f"[{key}] {label}"
+        styled = f"{HIGHLIGHT}{plain}{RESET}" if key == last_marker else plain
+        items.append((plain, styled))
+    for plain in ("[space] stop", f"[-/=] window={window}s"):
+        items.append((plain, plain))
+    return [styled for _, styled in wrap_tokens(items, width)]
+
+
+def welcome_screen():
+    """The title / instructions screen shown while a session is being set up."""
+    width, height = term_size()
+    box_w = min(BOX_MAX_WIDTH, max(24, width - 2))
+    inner = box_w - 4
+    tagline = random.choice(phrases.TAGLINES)  # fixed across sizing attempts
+
+    def centred(text, style=""):
+        if len(text) > inner:  # center() never truncates
+            text = text[: inner - 1] + "…"
+        return f"{style}{text.center(inner)}{RESET if style else ''}"
+
+    def build(pad, big):
+        # Title and tagline sit inside a box; the instructions stay outside it,
+        # so the branding reads as a separate block from the how-to below.
+        banner = title_rows(config.APP_NAME, inner) if big else None
+        if banner is None:  # too wide for block letters, or not wanted
+            banner = [config.APP_NAME.upper()]
+
+        body = [("", "")] if pad else []
+        body.extend((row, CYAN + BOLD) for row in banner)
+        body.append(("", ""))
+        body.append((tagline, HIGHLIGHT))
+        if pad:
+            body.append(("", ""))
+
+        out = ["", ""] if pad else [""]
+        out.extend(boxed(body, box_w))
+        out.append("")
+        out.append(centred("While recording, press a number to mark that moment:", BOLD))
+        out.append("")
+
+        items = [
+            (f"[{k}] {v}", f"{HIGHLIGHT}[{k}]{RESET} {v}")
+            for k, v in config.MARKERS.items()
+        ]
+        for plain, styled in wrap_tokens(items, inner):
+            out.append(" " * ((inner - len(plain)) // 2) + styled)
+
+        out.append("")
+        out.append(centred("space stops the recording   ·   - / = resize the graph", DIM))
+        out.append("")
+        return out
+
+    # Leave room for the two prompts that print underneath, plus a spare row,
+    # then shed padding and finally the block letters until it fits.
+    room = height - 3
+    screen = build(True, True)
+    for pad, big in ((False, True), (False, False)):
+        if len(screen) <= room:
+            break
+        screen = build(pad, big)
+    return screen
+
+
+def render(
+    points, elapsed, latest, rows, note, session_name, window, last_marker,
+    marker_events,
+):
     """Draw the readout + rolling humidity chart, in place."""
     width, height = term_size()
 
@@ -450,7 +516,22 @@ def render(points, elapsed, latest, rows, note, session_name, window, last_marke
         plt.xlim(start, end)
         lo, hi = min(ys), max(ys)
         pad = max(1.0, (hi - lo) * 0.15)
-        plt.ylim(max(0.0, lo - pad), min(100.0, hi + pad))
+        y_lo, y_hi = max(0.0, lo - pad), min(100.0, hi + pad)
+        plt.ylim(y_lo, y_hi)
+
+        # A vertical rule and the bare key for every marker still in view.
+        for at, key in marker_events:
+            if start <= at <= end:
+                plt.vertical_line(at, color="yellow")
+                plt.text(
+                    key,
+                    x=at,
+                    y=y_hi,
+                    color="black",
+                    background="yellow",
+                    style="bold",
+                    alignment="center",
+                )
     else:
         plt.plot([0, 1], [0, 0])
 
@@ -491,6 +572,7 @@ def record(source, name: str) -> None:
     window = config.PLOT_WINDOW_SECONDS
     retain = window
     last_marker: str | None = None
+    marker_events: deque[tuple[float, str]] = deque()  # (elapsed, key) for the graph
 
     f = open(path, "w", newline="")
     writer = csv.writer(f)
@@ -509,6 +591,9 @@ def record(source, name: str) -> None:
                     if key in config.MARKERS:
                         pending.append(config.MARKERS[key])
                         last_marker = key  # highlighted in the hint line
+                        marker_events.append(
+                            (0.0 if start is None else time.time() - start, key)
+                        )
                     elif key in ("-", "="):
                         if key == "-":
                             window += WINDOW_STEP
@@ -551,6 +636,8 @@ def record(source, name: str) -> None:
                     cutoff = points[-1][0] - retain
                     while points and points[0][0] < cutoff:
                         points.popleft()
+                    while marker_events and marker_events[0][0] < cutoff:
+                        marker_events.popleft()
 
                 if now - last_draw >= 0.25:
                     last_draw = now
@@ -559,7 +646,7 @@ def record(source, name: str) -> None:
                     elapsed = 0.0 if start is None else now - start
                     render(
                         points, elapsed, latest, rows, note,
-                        display_name, window, last_marker,
+                        display_name, window, last_marker, marker_events,
                     )
     except KeyboardInterrupt:
         pass  # Ctrl-C stops the session; the CSV is still finalized below.
@@ -648,7 +735,11 @@ def main() -> None:
                 print(f"  Unknown option: {choice}\n")
                 continue
 
-            name = input("  Session name (blank = timestamp only): ").strip()
+            # The welcome screen stays on show while the name is typed and
+            # while we wait for the Enter that starts the run.
+            sys.stdout.write("\033[2J\033[H")
+            print("\n".join(welcome_screen()))
+            name = input("  Session name: ").strip()
             input("  Press Enter to start recording...")
             record(source, name)
     except KeyboardInterrupt:

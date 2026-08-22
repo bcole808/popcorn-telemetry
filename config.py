@@ -1,5 +1,8 @@
 """Editable settings for the popcorn telemetry recorder."""
 
+# Shown in block letters on the welcome screen.
+APP_NAME = "Poptometry Analyzer"
+
 # Press one of these keys while recording to tag that moment in the CSV.
 # Add a row to extend the list — any single printable key works, and the
 # recorder picks it up for both the keypress handling and the on-screen legend.

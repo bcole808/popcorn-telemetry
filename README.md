@@ -60,14 +60,25 @@ uv run record.py --port /dev/cu.usbserial-0001
 uv run record.py --simulate   # fake data, no hardware needed
 ```
 
-Menu: **Enter** starts a new session, **q** quits. You're asked for a session
-name (blank = timestamp only), then Enter begins recording.
+Menu: **Enter** starts a new session, **q** quits. That brings up the welcome
+screen: a box holding the title in block letters with a tag line drawn at random
+from the 50 in [phrases.py](phrases.py), and below the box the marker keys with
+their labels. It stays on screen while you type the session name (blank =
+timestamp only) and while you wait to press Enter to begin.
+
+The title comes from `APP_NAME` in [config.py](config.py). A multi-word name
+wraps onto several lines of block letters when it's too wide to fit on one, and
+drops to plain text only if a single word still won't fit. On a short terminal
+the screen sheds its padding, and then its block letters, so the prompts below
+always stay on screen.
 
 While recording:
 
 - **space** — stop
-- **1**–**6** — drop a marker at this instant; that marker's hint turns bright
-  yellow and stays lit, so the hint line always shows what you marked last
+- **number keys** — drop a marker at this instant; that marker's hint turns
+  bright yellow and stays lit, so the hint line always shows what you marked
+  last, and a yellow vertical rule labelled with the bare number appears on the
+  graph at that moment (it scrolls away with the rolling window)
 - **-** / **=** — widen / narrow the visible time window by 30s (minimum 30s)
 - **Ctrl-C** — stop; the CSV is still finalized
 
