@@ -1,5 +1,6 @@
 # Recorded sessions — raw data, not source
 data/
+data-simulated/
 
 # Python
 .venv/

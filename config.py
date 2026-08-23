@@ -25,5 +25,11 @@ BAUD = 115200
 # session regardless of this.
 PLOT_WINDOW_SECONDS = 120
 
-# Where sessions are written, relative to this file.
+# How often the always-on background trace takes a reading, in seconds. It runs
+# for as long as the script does, including while a session is recording.
+BACKGROUND_INTERVAL_SECONDS = 10
+
+# Where sessions are written, relative to this file. Running with --simulate
+# uses the second one instead, so fake runs never mix in with real ones.
 DATA_DIR = "data"
+DATA_DIR_SIMULATED = "data-simulated"

@@ -34,7 +34,7 @@ import phrases
 
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
-HEADER =["seconds_elapsed", "humidity", "temperature_f", "label", "timestamp"]
+HEADER = ["timestamp", "seconds_elapsed", "humidity", "temperature_f", "label"]
 
 # Serial devices that are never our board.
 PORT_BLOCKLIST = ("Bluetooth-Incoming-Port", "debug-console")
@@ -49,6 +49,7 @@ RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 CYAN = "\033[96m"
+GREY = "\033[90m"  # light grey — the subtle live readings on the welcome screen
 
 BOX_MAX_WIDTH = 88
 
@@ -177,7 +178,10 @@ class SimulatedSource:
 
 
 def ask_optional_number(
-    prompt: str, low: float | None = None, high: float | None = None
+    prompt: str,
+    low: float | None = None,
+    high: float | None = None,
+    on_idle=None,
 ) -> int | None:
     """Ask for a number the user may skip with a bare Enter.
 
@@ -187,7 +191,7 @@ def ask_optional_number(
     """
     while True:
         try:
-            raw = input(prompt).strip()
+            raw = prompt_line(prompt, on_idle).strip()
         except EOFError:
             return None
         if not raw:
@@ -214,10 +218,95 @@ def slugify(name: str) -> str:
     return slug
 
 
+# Set from --simulate in main(). Everything below derives its paths from
+# data_dir(), so flipping this moves the whole tree — day folders, the demo
+# folder and the background trace included.
+SIMULATED = False
+
+
 def data_dir() -> str:
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), config.DATA_DIR)
+    name = config.DATA_DIR_SIMULATED if SIMULATED else config.DATA_DIR
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def day_dir(when: datetime | None = None) -> str:
+    """data/2026-08-22/ — one folder per day, created on demand."""
+    when = when or datetime.now()
+    path = os.path.join(data_dir(), f"{when:%Y-%m-%d}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+BACKGROUND_SUFFIX = "__background-data.csv"
+
+
+def background_path(when: datetime | None = None) -> str:
+    when = when or datetime.now()
+    return os.path.join(day_dir(when), f"{when:%Y-%m-%d}{BACKGROUND_SUFFIX}")
+
+
+class BackgroundLog:
+    """A slow, always-on trace of the room, running for as long as the CLI does.
+
+    Samples land on wall-clock multiples of INTERVAL, so every background
+    timestamp coincides exactly with one of the per-second rows in whatever
+    session happens to be recording at the time. The day's file is appended to,
+    so stopping and restarting the script continues the same trace, and a run
+    that crosses midnight rolls onto the next day's file by itself.
+    """
+
+    HEADER = ["timestamp", "humidity", "temperature_f", "label"]
+
+    def __init__(self, interval: int | None = None):
+        self.interval = interval or config.BACKGROUND_INTERVAL_SECONDS
+        self.latest: tuple[float, float] | None = None  # (temp_f, humidity)
+        self.next_at: float | None = None
+        self.pending: deque[str] = deque()
+
+    def observe(self, readings) -> None:
+        """Take the newest reading from whoever is polling the sensor."""
+        if readings:
+            temp_c, humidity = readings[-1]
+            self.latest = (c_to_f(temp_c), humidity)
+
+    def note(self, label: str) -> None:
+        self.pending.append(label)
+
+    def tick(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        if self.next_at is None:
+            self.next_at = math.ceil(now / self.interval) * self.interval
+
+        # Events are stamped at the second they happened rather than waiting for
+        # the next slot, so a session's start and end line up with its own rows.
+        while self.pending:
+            self._write(int(now), self.pending.popleft())
+
+        if now >= self.next_at:
+            self._write(int(self.next_at), "")
+            self.next_at += self.interval
+            if self.next_at <= now:  # fell behind (a sleeping laptop); resync
+                self.next_at = math.ceil(now / self.interval) * self.interval
+
+    def _write(self, when: float, label: str) -> None:
+        if self.latest is None and not label:
+            return  # nothing read yet, and nothing to say
+        stamp = datetime.fromtimestamp(when)
+        path = background_path(stamp)
+        fresh = not os.path.exists(path)
+        temp_f, humidity = self.latest if self.latest else (None, None)
+        with open(path, "a", newline="") as handle:
+            writer = csv.writer(handle)
+            if fresh:
+                writer.writerow(self.HEADER)
+            writer.writerow([
+                stamp.strftime("%Y-%m-%dT%H:%M:%S"),
+                "" if humidity is None else f"{humidity:.2f}",
+                "" if temp_f is None else f"{temp_f:.2f}",
+                label,
+            ])
 
 
 def session_avg_humidity(path: str) -> float | None:
@@ -238,7 +327,10 @@ def todays_runs(when: datetime | None = None) -> list[tuple[str, float]]:
     """(session name, average humidity) for each session recorded today."""
     when = when or datetime.now()
     runs = []
-    for path in sorted(glob.glob(os.path.join(data_dir(), f"{when:%Y-%m-%d}__*.csv"))):
+    pattern = os.path.join(day_dir(when), f"{when:%Y-%m-%d}__*.csv")
+    for path in sorted(glob.glob(pattern)):
+        if path.endswith(BACKGROUND_SUFFIX):
+            continue  # the always-on trace is not a session
         average = session_avg_humidity(path)
         if average is None:
             continue
@@ -268,9 +360,25 @@ def write_metadata(csv_path: str, meta: dict) -> str:
     return path
 
 
+DEMO_NAME = "demo"
+
+
+def session_dir(name: str, when: datetime | None = None) -> str:
+    """Where a session's files go: its own folder if it is a demo run.
+
+    Matched on the slug, so "Demo" and " demo " land there too — those already
+    produce the same filename as "demo" everywhere else.
+    """
+    if slugify(name) == DEMO_NAME:
+        path = os.path.join(data_dir(), DEMO_NAME)
+        os.makedirs(path, exist_ok=True)
+        return path
+    return day_dir(when)
+
+
 def session_path(name: str, when: datetime | None = None) -> str:
     when = when or datetime.now()
-    data_dir_path = data_dir()
+    data_dir_path = session_dir(name, when)
 
     stamp = f"{when:%Y-%m-%d}__{when.hour % 12 or 12}-{when:%M}{when:%p}".lower()
     slug = slugify(name)
@@ -290,19 +398,106 @@ def session_path(name: str, when: datetime | None = None) -> str:
 
 
 @contextmanager
-def cbreak_stdin():
+def cbreak_stdin(hide_cursor=True):
     """Read keys one at a time; always restore the terminal, even on a crash."""
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd)
-        sys.stdout.write("\033[?25l")  # hide cursor
-        sys.stdout.flush()
+        if hide_cursor:
+            sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
         yield
     finally:
         sys.stdout.write("\033[?25h\033[0m")
         sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def read_keys():
+    """Every keystroke currently available.
+
+    Read straight from the file descriptor: sys.stdin.read(1) pulls a whole
+    chunk into Python's buffer and hands back one character, after which
+    select() sees an idle fd while the rest sits stranded in that buffer. That
+    strands input on a paste or a fast burst of typing.
+    """
+    try:
+        data = os.read(sys.stdin.fileno(), 1024)
+    except (BlockingIOError, InterruptedError):
+        return ""
+    return data.decode("utf-8", "replace")
+
+
+def make_idle(source, background, live=None):
+    """An idle callback for prompt_line that keeps the sensor pumping.
+
+    Only one place may call source.poll(), because polling drains the serial
+    buffer — so it is called here and the readings are handed to each consumer.
+    """
+    def idle():
+        try:
+            readings, _ = source.poll()
+        except Exception:
+            readings = []  # a flaky sensor must not wedge a prompt
+        background.observe(readings)
+        background.tick()
+        if live is None:
+            return False
+        live.observe(readings)
+        return live.tick(time.time())
+
+    return idle
+
+
+def prompt_line(prompt, on_idle=None):
+    """Read one line, repainting `live` while the user types.
+
+    Hand-rolled rather than using input() because input() goes through readline,
+    which redraws from its own cached cursor position; anything else painting
+    the screen invalidates that and corrupts the line on backspace. Owning the
+    echo here keeps the two in step.
+    """
+    buf: list[str] = []
+
+    def draw():
+        sys.stdout.write("\r\033[2K" + prompt + "".join(buf))
+        sys.stdout.flush()
+
+    with cbreak_stdin(hide_cursor=False):
+        draw()
+        while True:
+            if on_idle is not None and on_idle():
+                draw()  # a repaint moved the cursor; put it back
+            if not select.select([sys.stdin], [], [], 0.1)[0]:
+                continue
+            keys = read_keys()
+            if keys == "":
+                raise EOFError
+            i = 0
+            while i < len(keys):
+                key = keys[i]
+                i += 1
+                if key in ("\r", "\n"):
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return "".join(buf)
+                if key == "\x03":
+                    raise KeyboardInterrupt
+                if key in ("\x7f", "\b"):
+                    if buf:
+                        buf.pop()
+                elif key == "\x15":  # ctrl-u clears the line
+                    buf.clear()
+                elif key == "\x1b":  # skip arrow keys and other escapes
+                    if i < len(keys) and keys[i] in "[O":
+                        i += 1
+                        while i < len(keys) and not (keys[i].isalpha() or keys[i] == "~"):
+                            i += 1
+                        i += 1
+                elif key.isprintable():
+                    buf.append(key)
+            draw()
 
 
 def term_size():
@@ -336,7 +531,30 @@ def boxed(body, box_w):
     return out
 
 
-def title_rows(name, inner):
+SPARK = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values, width, min_span=2.0):
+    """A tiny block-character chart of the most recent `width` values.
+
+    The scale never shrinks below `min_span`, so a signal that is essentially
+    flat reads as flat instead of having its noise amplified to full height.
+    """
+    recent = list(values)[-width:]
+    if not recent:
+        return ""
+    lo, hi = min(recent), max(recent)
+    if hi - lo < min_span:
+        middle = (hi + lo) / 2
+        lo, hi = middle - min_span / 2, middle + min_span / 2
+    span = hi - lo
+    if span < 1e-9:
+        return SPARK[len(SPARK) // 2] * len(recent)
+    steps = len(SPARK) - 1
+    return "".join(SPARK[round((v - lo) / span * steps)] for v in recent)
+
+
+def title_rows(name, inner, gap=True):
     """Block-letter rows for `name`, wrapped over several lines if too wide.
 
     Returns None when even a single word is too wide to render, leaving the
@@ -357,7 +575,7 @@ def title_rows(name, inner):
     for i, line in enumerate(lines):
         if bigtext.width(line) > inner:
             return None
-        if i:
+        if i and gap:
             rows.append("")  # breathing room between title lines
         rows.extend(bigtext.render(line))
     return rows
@@ -454,9 +672,75 @@ def hint_lines(width, window, last_marker):
         plain = f"[{key}] {label}"
         styled = f"{HIGHLIGHT}{plain}{RESET}" if key == last_marker else plain
         items.append((plain, styled))
-    for plain in ("[space] stop", f"[-/=] window={window}s"):
+    for plain in ("[enter] stop", f"[-/=] window={window}s"):
         items.append((plain, plain))
     return [styled for _, styled in wrap_tokens(items, width)]
+
+
+class LiveReadings:
+    """Sparklines of the live sensor values, on reserved welcome-screen rows.
+
+    Driven by prompt_line rather than a thread: painting the screen while a
+    line editor is running has to happen between keystrokes, not alongside
+    them, or the two fight over the cursor.
+    """
+
+    ROWS = 2
+
+    def __init__(self, row, box_w, period=1.0):
+        self.latest: tuple[float, float] | None = None
+        self.row = row  # 1-based screen row of the first line
+        self.box_w = box_w
+        self.period = period
+        self.width = max(12, min(44, box_w - 4 - 22))
+        self.humidity = deque(maxlen=self.width)
+        self.temps = deque(maxlen=self.width)
+        self.next_poll = 0.0
+
+    def observe(self, readings):
+        """Take the newest reading from whoever is polling the sensor."""
+        if readings:
+            temp_c, humidity = readings[-1]
+            self.latest = (c_to_f(temp_c), humidity)
+
+    def tick(self, now):
+        """Append a history point and repaint if due. True if the screen moved."""
+        if now < self.next_poll:
+            return False
+        self.next_poll = now + self.period
+        if self.latest is not None:
+            self.temps.append(self.latest[0])
+            self.humidity.append(self.latest[1])
+        self._paint()
+        return True
+
+    # Smallest scale each sparkline will use, so ordinary sensor jitter reads as
+    # a flat line rather than a dramatic sawtooth. Temperature gets the wider
+    # floor because a degree or two of drift is not news; humidity moves less.
+    HUMIDITY_MIN_SPAN = 2.0   # %RH
+    TEMP_MIN_SPAN = 5.0       # °F
+
+    def _rows(self):
+        if not self.humidity:
+            return ["waiting for the sensor…", ""]
+        humidity_spark = sparkline(self.humidity, self.width, self.HUMIDITY_MIN_SPAN)
+        temp_spark = sparkline(self.temps, self.width, self.TEMP_MIN_SPAN)
+        return [
+            f"humidity {self.humidity[-1]:6.1f} %RH  {humidity_spark}",
+            f"temp     {self.temps[-1]:6.1f} °F   {temp_spark}",
+        ]
+
+    def _paint(self):
+        inner = self.box_w - 4
+        rows = [r[:inner] for r in self._rows()]
+        # One shared indent so the two sparklines stay aligned with each other.
+        indent = " " * max(0, (inner - max(len(r) for r in rows)) // 2)
+        moves = "".join(
+            f"\033[{self.row + i};1H│ {GREY}{(indent + text).ljust(inner)}{RESET} │"
+            for i, text in enumerate(rows)
+        )
+        sys.stdout.write("\033[s" + moves + "\033[u")
+        sys.stdout.flush()
 
 
 def welcome_screen():
@@ -471,10 +755,10 @@ def welcome_screen():
             text = text[: inner - 1] + "…"
         return f"{style}{text.center(inner)}{RESET if style else ''}"
 
-    def build(pad, big):
+    def build(pad, big, gap=True):
         # Title and tagline sit inside a box; the instructions stay outside it,
         # so the branding reads as a separate block from the how-to below.
-        banner = title_rows(config.APP_NAME, inner) if big else None
+        banner = title_rows(config.APP_NAME, inner, gap) if big else None
         if banner is None:  # too wide for block letters, or not wanted
             banner = [config.APP_NAME.upper()]
 
@@ -482,10 +766,17 @@ def welcome_screen():
         body.extend((row, CYAN + BOLD) for row in banner)
         body.append(("", ""))
         body.append((tagline, HIGHLIGHT))
+        # Blank rows held for LiveReadings to paint over once the prompts are up.
+        live_index = len(body)
+        body.extend([("", "")] * LiveReadings.ROWS)
         if pad:
             body.append(("", ""))
 
-        out = ["", ""] if pad else [""]
+        prefix = ["", ""] if pad else [""]
+        out = list(prefix)
+        # body[i] lands at out index len(prefix) + 1 + i (past the top border),
+        # and screen rows are 1-based.
+        live_row = len(prefix) + live_index + 2
         out.extend(boxed(body, box_w))
         out.append("")
         out.append(centred("While recording, press a number to mark that moment:", BOLD))
@@ -499,21 +790,19 @@ def welcome_screen():
             out.append(" " * ((inner - len(plain)) // 2) + styled)
 
         out.append("")
-        out.append(centred("space stops the recording   ·   - / = resize the graph", DIM))
-        out.append("")
-        return out
+        out.append(centred("enter stops the recording   ·   - / = resize the graph", DIM))
+        return out, live_row
 
-    # Leave room for the two prompts that print underneath, plus a spare row,
-    # then shed padding and finally the block letters until it fits.
     # Five prompts print underneath (name, humidity, temperature, fan speed,
-    # Enter), plus a spare row.
-    room = height - 6
-    screen = build(True, True)
-    for pad, big in ((False, True), (False, False)):
+    # Enter). Shed the padding, then the gap between title lines, then the
+    # block letters, until the whole thing fits above them.
+    room = height - 5
+    screen, live_row = build(True, True)
+    for attempt in ((False, True, True), (False, True, False), (False, False, True)):
         if len(screen) <= room:
             break
-        screen = build(pad, big)
-    return screen
+        screen, live_row = build(*attempt)
+    return screen, live_row, box_w
 
 
 def render(
@@ -605,6 +894,7 @@ def render(
 
 def record(
     source,
+    background: BackgroundLog,
     name: str,
     ambient_rh: int | None = None,
     ambient_f: int | None = None,
@@ -623,6 +913,8 @@ def record(
         "fan_speed_pct": fan_pct,
     }
     write_metadata(path, meta)  # written up front so a crashed run keeps it
+    background.note(f"recording_started: {os.path.basename(path)}")
+    background.tick()
     display_name = name or "(untitled)"
 
     points: deque[tuple[float, float]] = deque()
@@ -652,23 +944,26 @@ def record(
     try:
         with cbreak_stdin():
             while True:
-                ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-                if ready:
-                    key = sys.stdin.read(1)
-                    if key == " ":
-                        break
-                    if key in config.MARKERS:
-                        pending.append(config.MARKERS[key])
-                        last_marker = key  # highlighted in the hint line
-                        marker_events.append(
-                            (0.0 if start is None else time.time() - start, key)
-                        )
-                    elif key in ("-", "="):
-                        if key == "-":
-                            window += WINDOW_STEP
-                            retain = max(retain, window)
-                        else:
-                            window = max(WINDOW_MIN, window - WINDOW_STEP)
+                stopping = False
+                if select.select([sys.stdin], [], [], 0.05)[0]:
+                    for key in read_keys():
+                        if key in ("\r", "\n"):
+                            stopping = True
+                            break
+                        if key in config.MARKERS:
+                            pending.append(config.MARKERS[key])
+                            last_marker = key  # highlighted in the hint line
+                            marker_events.append(
+                                (0.0 if start is None else time.time() - start, key)
+                            )
+                        elif key in ("-", "="):
+                            if key == "-":
+                                window += WINDOW_STEP
+                                retain = max(retain, window)
+                            else:
+                                window = max(WINDOW_MIN, window - WINDOW_STEP)
+                if stopping:
+                    break
 
                 readings, notes = source.poll()
                 if notes:
@@ -676,6 +971,9 @@ def record(
                     note_until = time.time() + 3
 
                 now = time.time()
+                # The slow background trace keeps running through the session.
+                background.observe(readings)
+                background.tick(now)
                 for temp_c, humidity in readings:
                     if start is None:
                         start = now
@@ -688,11 +986,15 @@ def record(
                     if second > last_second:
                         last_second = second
                         writer.writerow([
+                            # Derived from the second boundary rather than the
+                            # write moment, so wall-clock seconds run 1:1 with
+                            # seconds_elapsed and line up with the background file.
+                            datetime.fromtimestamp(int(start) + second)
+                            .strftime("%Y-%m-%dT%H:%M:%S"),
                             second,
                             f"{humidity:.2f}",
                             f"{temp_f:.2f}",
                             pending.popleft() if pending else "",
-                            datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
                         ])
                         f.flush()
                         rows += 1
@@ -729,13 +1031,19 @@ def record(
             while pending:
                 last_second += 1
                 tail_writer.writerow([
+                    # Same second-boundary basis as the rows above it.
+                    datetime.fromtimestamp(
+                        (int(start) if start else int(time.time())) + last_second
+                    ).strftime("%Y-%m-%dT%H:%M:%S"),
                     last_second,
                     "",
                     "",
                     pending.popleft(),
-                    datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
                 ])
                 rows += 1
+
+    background.note(f"recording_ended: {os.path.basename(path)}")
+    background.tick()
 
     duration = 0.0 if start is None else time.time() - start
     clock = f"{int(duration // 60):02d}:{int(duration % 60):02d}"
@@ -804,37 +1112,57 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    source = SimulatedSource() if args.simulate else SerialSource(args.port)
+    global SIMULATED
+    SIMULATED = args.simulate
 
+    source = SimulatedSource() if args.simulate else SerialSource(args.port)
+    background = BackgroundLog()
+
+    # Launching the script is itself the request to start a session, so the
+    # first pass drops straight into the new-session screen.
+    skip_menu = True
     try:
         while True:
-            print("  [enter] new session    [q] quit")
-            try:
-                choice = input("> ").strip().lower()
-            except EOFError:
-                break
-            if choice in ("q", "quit"):
-                break
-            if choice not in ("", "n", "new"):
-                print(f"  Unknown option: {choice}\n")
-                continue
+            if not skip_menu:
+                print("  [enter] new session    [q] quit")
+                # Not input(): the menu has to keep pumping the sensor so the
+                # background trace carries on between sessions.
+                try:
+                    choice = prompt_line(
+                        "> ", make_idle(source, background)
+                    ).strip().lower()
+                except EOFError:
+                    break
+                if choice in ("q", "quit"):
+                    break
+                if choice not in ("", "n", "new"):
+                    print(f"  Unknown option: {choice}\n")
+                    continue
+            skip_menu = False
 
             # The welcome screen stays on show while the name is typed and
             # while we wait for the Enter that starts the run.
             sys.stdout.write("\033[2J\033[H")
-            print("\n".join(welcome_screen()))
-            name = input("  Session name: ").strip()
-            ambient_rh = ask_optional_number(
-                "  Room humidity %RH (optional, Enter to skip): ", 0, 100
-            )
-            ambient_f = ask_optional_number(
-                "  Room temperature °F (optional, Enter to skip): "
-            )
-            fan_pct = ask_optional_number(
-                "  Fan speed % (optional, Enter to skip): ", 0, 100
-            )
-            input("  Press Enter to start recording...")
-            record(source, name, ambient_rh, ambient_f, fan_pct)
+            screen, live_row, box_w = welcome_screen()
+            print("\n".join(screen))
+            # The sparklines repaint between keystrokes as the prompts run.
+            live = LiveReadings(live_row, box_w)
+            idle = make_idle(source, background, live)
+            try:
+                name = prompt_line("  Session name: ", idle).strip()
+                ambient_rh = ask_optional_number(
+                    "  Room humidity %RH (optional, Enter to skip): ", 0, 100, idle
+                )
+                ambient_f = ask_optional_number(
+                    "  Room temperature °F (optional, Enter to skip): ", on_idle=idle
+                )
+                fan_pct = ask_optional_number(
+                    "  Fan speed % (optional, Enter to skip): ", 0, 100, idle
+                )
+                prompt_line("  Press Enter to start recording...", idle)
+            except EOFError:
+                break
+            record(source, background, name, ambient_rh, ambient_f, fan_pct)
     except KeyboardInterrupt:
         print()
     finally:

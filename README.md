@@ -66,6 +66,13 @@ from the 50 in [phrases.py](phrases.py), and below the box the marker keys with
 their labels. It stays on screen while you type the session name (blank =
 timestamp only) and while you wait to press Enter to begin.
 
+Under the tag line sit two small grey sparklines — one for humidity, one for
+temperature — showing the current reading and its recent history. They repaint
+about once a second while you answer the prompts, so you can see the sensor is
+alive and the room has settled before starting a run. Their scale never shrinks
+below a couple of points (`HUMIDITY_MIN_SPAN` / `TEMP_MIN_SPAN` on
+`LiveReadings`), so ordinary jitter reads as a flat line rather than a sawtooth.
+
 The title comes from `APP_NAME` in [config.py](config.py). A multi-word name
 wraps onto several lines of block letters when it's too wide to fit on one, and
 drops to plain text only if a single word still won't fit. On a short terminal
@@ -74,7 +81,7 @@ always stay on screen.
 
 While recording:
 
-- **space** — stop
+- **Enter** — stop
 - **number keys** — drop a marker at this instant; that marker's hint turns
   bright yellow and stays lit, so the hint line always shows what you marked
   last, and a yellow vertical rule labelled with the bare number appears on the
@@ -128,12 +135,48 @@ MARKERS = {
 
 ## Output
 
-Each session writes a pair of files into `data/` (gitignored), sharing one name:
+`data/` (gitignored) holds one folder per day. Running with `--simulate` writes
+to `data-simulated/` instead — same layout, day folders and background trace and
+all — so fake runs never mix in with real ones. Both are gitignored. Each session writes a pair of
+files there, sharing one name, alongside that day's background trace:
 
 ```
-2026-08-21__4-45pm__my-session-name.csv     the readings
-2026-08-21__4-45pm__my-session-name.json    everything else about the run
+data/2026-08-21/
+  2026-08-21__background-data.csv           the always-on slow trace
+  2026-08-21__4-45pm__my-session-name.csv   the session's readings
+  2026-08-21__4-45pm__my-session-name.json  everything else about the run
 ```
+
+### The background trace
+
+One file per day, recording continuously for as long as the script is running —
+at the menu, while you answer the setup prompts, throughout a session, and after
+it ends. It samples once every `BACKGROUND_INTERVAL_SECONDS` (10 by default, in
+[config.py](config.py)), which is what makes it useful for seeing what the room
+did *after* a pop session finished.
+
+Columns are `timestamp, humidity, temperature_f, label` — no `seconds_elapsed`,
+since it isn't tied to any one run.
+
+Samples land on wall-clock multiples of the interval, so every background
+timestamp coincides exactly with one of the per-second rows of whatever session
+was recording at the time, and the two files can be joined on `timestamp`.
+
+The day's file is appended to, so stopping and restarting the script continues
+the same trace rather than starting a new one, and a run that crosses midnight
+rolls onto the next day's file by itself.
+
+The `label` column marks session boundaries:
+
+```
+timestamp,humidity,temperature_f,label
+2026-08-21T16:45:03,48.35,76.08,recording_started: 2026-08-21__4-45pm__my-session-name.csv
+2026-08-21T16:52:18,56.70,77.74,recording_ended: 2026-08-21__4-45pm__my-session-name.csv
+```
+
+Those two rows are stamped at the exact second the session started and stopped
+rather than waiting for the next scheduled slot, so they line up with the
+session's own first and last rows. Every other row falls on the interval.
 
 ### Setup questions
 
@@ -173,11 +216,11 @@ setup behind, then rewritten with the results when the session ends.
 
 | column | example | notes |
 | ------ | ------- | ----- |
+| `timestamp` | `2026-08-21T16:45:03` | local wall-clock |
 | `seconds_elapsed` | `0`, `1`, `2`, … | integer seconds since recording started |
 | `humidity` | `58.77` | %RH |
 | `temperature_f` | `88.56` | °F — the sensor reports Celsius, converted on the way in |
 | `label` | `popping_started` | blank unless a marker was pressed since the last row |
-| `timestamp` | `2026-08-21T16:45:03` | local wall-clock |
 
 The sensor samples at 2 Hz but the CSV is capped at one row per second: the row
 for second *N* carries the first reading taken at or after that second. Rows are
