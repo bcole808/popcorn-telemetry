@@ -182,7 +182,8 @@ def ask_optional_number(
     low: float | None = None,
     high: float | None = None,
     on_idle=None,
-) -> int | None:
+    integer: bool = True,
+) -> float | None:
     """Ask for a number the user may skip with a bare Enter.
 
     Tolerates a trailing unit ("56%", "75F", "75°F") and re-asks on anything
@@ -198,14 +199,19 @@ def ask_optional_number(
             return None
         cleaned = raw.rstrip("%").strip().rstrip("Ff").strip().rstrip("°").strip()
         try:
-            value = round(float(cleaned))
+            value = float(cleaned)
         except ValueError:
             print("    Please enter a number, or press Enter to skip.")
             continue
         if (low is not None and value < low) or (high is not None and value > high):
-            print(f"    Please enter a number between {low:g} and {high:g}.")
+            if high is None:
+                print(f"    Please enter a number of at least {low:g}.")
+            elif low is None:
+                print(f"    Please enter a number of at most {high:g}.")
+            else:
+                print(f"    Please enter a number between {low:g} and {high:g}.")
             continue
-        return value
+        return round(value) if integer else value
 
 
 def short(name: str, limit: int = 13) -> str:
@@ -349,6 +355,27 @@ def session_label(path: str) -> str:
 
 def metadata_path(csv_path: str) -> str:
     return os.path.splitext(csv_path)[0] + ".json"
+
+
+# Each is reported as "seconds_from_<start>_to_<end>" in the session's JSON.
+LABEL_INTERVALS = [
+    ("kettle_hot", "kernels_in"),
+    ("kernels_in", "pop_started"),
+    ("kernels_in", "pop_rapid"),
+    ("kernels_in", "heat_off"),
+    ("kernels_in", "dump_kettle"),
+]
+
+
+def label_intervals(label_times: dict[str, float]) -> dict[str, float | None]:
+    """Seconds between pairs of markers, null where either was never pressed."""
+    out = {}
+    for start, end in LABEL_INTERVALS:
+        a, b = label_times.get(start), label_times.get(end)
+        out[f"seconds_from_{start}_to_{end}"] = (
+            None if a is None or b is None else round(b - a, 1)
+        )
+    return out
 
 
 def write_metadata(csv_path: str, meta: dict) -> str:
@@ -793,10 +820,10 @@ def welcome_screen():
         out.append(centred("enter stops the recording   ·   - / = resize the graph", DIM))
         return out, live_row
 
-    # Five prompts print underneath (name, humidity, temperature, fan speed,
-    # Enter). Shed the padding, then the gap between title lines, then the
+    # Six prompts print underneath (name, popcorn qty, humidity, temperature,
+    # fan speed, Enter). Shed the padding, then the gap between title lines, then the
     # block letters, until the whole thing fits above them.
-    room = height - 5
+    room = height - 6
     screen, live_row = build(True, True)
     for attempt in ((False, True, True), (False, True, False), (False, False, True)):
         if len(screen) <= room:
@@ -899,6 +926,7 @@ def record(
     ambient_rh: int | None = None,
     ambient_f: int | None = None,
     fan_pct: int | None = None,
+    popcorn_cups: float | None = None,
 ) -> None:
     path = session_path(name)
 
@@ -908,6 +936,7 @@ def record(
         "session_name": name or None,
         "csv": os.path.basename(path),
         "started_at": datetime.now().isoformat(timespec="seconds"),
+        "popcorn_qty_cups": popcorn_cups,
         "ambient_humidity_rh": ambient_rh,
         "ambient_temperature_f": ambient_f,
         "fan_speed_pct": fan_pct,
@@ -934,6 +963,9 @@ def record(
     retain = window
     last_marker: str | None = None
     marker_events: deque[tuple[float, str]] = deque()  # (elapsed, key) for the graph
+    # When each label was last pressed, in seconds elapsed — the last press
+    # wins, so a marker can be corrected by pressing it again.
+    label_times: dict[str, float] = {}
 
     f = open(path, "w", newline="")
     writer = csv.writer(f)
@@ -953,9 +985,9 @@ def record(
                         if key in config.MARKERS:
                             pending.append(config.MARKERS[key])
                             last_marker = key  # highlighted in the hint line
-                            marker_events.append(
-                                (0.0 if start is None else time.time() - start, key)
-                            )
+                            at = 0.0 if start is None else time.time() - start
+                            marker_events.append((at, key))
+                            label_times[config.MARKERS[key]] = at
                         elif key in ("-", "="):
                             if key == "-":
                                 window += WINDOW_STEP
@@ -1060,6 +1092,7 @@ def record(
         "temperature_f_avg": (
             round(sum(temps_f) / len(temps_f), 2) if temps_f else None
         ),
+        **label_intervals(label_times),
     })
     write_metadata(path, meta)
 
@@ -1121,6 +1154,10 @@ def main() -> None:
     # Launching the script is itself the request to start a session, so the
     # first pass drops straight into the new-session screen.
     skip_menu = True
+    # The room doesn't change between batches, so it is asked for once per run
+    # and reused; a skipped answer is asked for again on the next batch.
+    ambient_rh: int | None = None
+    ambient_f: int | None = None
     try:
         while True:
             if not skip_menu:
@@ -1150,19 +1187,31 @@ def main() -> None:
             idle = make_idle(source, background, live)
             try:
                 name = prompt_line("  Session name: ", idle).strip()
-                ambient_rh = ask_optional_number(
-                    "  Room humidity %RH (optional, Enter to skip): ", 0, 100, idle
+                popcorn_cups = ask_optional_number(
+                    "  Popcorn qty in cups, e.g. 1 or 0.5 (optional, Enter to skip): ",
+                    0, None, idle, integer=False,
                 )
-                ambient_f = ask_optional_number(
-                    "  Room temperature °F (optional, Enter to skip): ", on_idle=idle
-                )
+                if ambient_rh is None:
+                    ambient_rh = ask_optional_number(
+                        "  Room humidity %RH (optional, Enter to skip): ", 0, 100, idle
+                    )
+                else:
+                    print(f"  Room humidity %RH: {ambient_rh} (from earlier this run)")
+                if ambient_f is None:
+                    ambient_f = ask_optional_number(
+                        "  Room temperature °F (optional, Enter to skip): ", on_idle=idle
+                    )
+                else:
+                    print(f"  Room temperature °F: {ambient_f} (from earlier this run)")
                 fan_pct = ask_optional_number(
                     "  Fan speed % (optional, Enter to skip): ", 0, 100, idle
                 )
                 prompt_line("  Press Enter to start recording...", idle)
             except EOFError:
                 break
-            record(source, background, name, ambient_rh, ambient_f, fan_pct)
+            record(
+                source, background, name, ambient_rh, ambient_f, fan_pct, popcorn_cups
+            )
     except KeyboardInterrupt:
         print()
     finally:

@@ -7,13 +7,15 @@ APP_NAME = "Poptometry Analyzer"
 # Add a row to extend the list — any single printable key works, and the
 # recorder picks it up for both the keypress handling and the on-screen legend.
 MARKERS = {
-    "1": "kernels_in",
-    "2": "pop_started",
-    "3": "heat_off",
-    "4": "stir_off",
-    "5": "dump_kettle",
-    "6": "door_opened",
-    "7": "door_closed",
+    "1": "kettle_hot",
+    "2": "kernels_in",
+    "3": "pop_started",
+    "4": "pop_rapid",
+    "5": "heat_off",
+    "6": "stir_off",
+    "7": "dump_kettle",
+    "8": "door_opened",
+    "9": "door_closed",
 }
 
 # Serial link to the ESP32. Must match Serial.begin() in firmware/src/main.cpp.
